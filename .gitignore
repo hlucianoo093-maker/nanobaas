@@ -1,0 +1,16 @@
+node_modules/
+apps/api/dist/
+apps/admin/dist/
+dist/
+.env
+.env.*
+!.env.example
+data/
+backups/
+coverage/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log
+.DS_Store
+Thumbs.db

@@ -15,11 +15,34 @@ NanoBaaS is a lightweight multi-project backend built on Fastify 5, SQLite, bett
 - Project-scoped file uploads/downloads/deletion through a local storage adapter, with bounded multipart size and MIME signature checks.
 - Project-scoped webhook CRUD and one-time signing secrets; AES-256-GCM encrypted secret storage, HMAC-signed events, and transactional durable delivery queues with bounded retries.
 - HTTPS-only webhook delivery with public-IP DNS checks, pinned destinations, redirect rejection, bounded timeouts, and queue backpressure.
+- Project-scoped, ephemeral WebSocket Pub/Sub channels with JWT session checks, explicit subscribe/publish permissions, bounded connection and message limits, and no message history.
 - OpenAPI UI at `/documentation`.
 - Responsive React administration dashboard at `/admin/`, served from the API origin and backed only by authenticated REST endpoints. It supports guided project setup with optional one-time API key issuance, project-scoped management, and instance-level user administration, safe runtime settings, and platform audit logs for configured administrators. Runtime settings exclude secrets and infrastructure paths.
 - Vitest integration tests and a non-root Docker deployment configuration.
 
 Advanced query operators/indexing and scheduled off-host backup retention remain operational follow-ups.
+
+## Realtime Pub/Sub
+
+Connect to `ws://localhost:3000/api/v1/projects/{projectId}/realtime` (use `wss://` behind TLS). Existing active project members authenticate with their access JWT in the first WebSocket frame; do not put tokens in the URL:
+
+```json
+{ "type": "authenticate", "accessToken": "<access-jwt>" }
+```
+
+Subscribe and publish with separate JSON frames:
+
+```json
+{ "type": "subscribe", "channel": "orders" }
+```
+
+```json
+{ "type": "publish", "channel": "orders", "event": "order.created", "payload": { "orderId": "order-1" } }
+```
+
+The server acknowledges with `authenticated`, `subscribed`, and `published` frames; subscribed clients receive `message` frames containing the event, payload, generated message ID, and send timestamp. Send `{"type":"unsubscribe","channel":"orders"}` to leave a channel. Project owners can use both operations; other members need the `realtime:subscribe` and/or `realtime:publish` permission assigned through a project role. Messages are ephemeral: only currently connected subscribers receive them, with no history or replay. The in-memory hub is single-process only; multi-instance deployments need a shared broker.
+
+The service bounds connections (256 total, 100 per project, 5 per user per project), subscriptions (10 channels per connection), frames (16 KiB), outbound buffering (256 KiB), inbound traffic (120 frames and 30 publishes per 10 seconds per connection), and handshakes (30 per minute per IP).
 
 ## Requirements
 
@@ -116,6 +139,7 @@ Initial routes:
 - `GET /api/v1/projects/:projectId/storage/files/:fileId/content`
 - `GET|POST /api/v1/projects/:projectId/webhooks`
 - `PATCH|DELETE /api/v1/projects/:projectId/webhooks/:webhookId`, `POST /api/v1/projects/:projectId/webhooks/:webhookId/rotate-secret`
+- `WS /api/v1/projects/:projectId/realtime` (ephemeral Pub/Sub channels)
 - `GET /api/v1/projects/:projectId/overview`, `/audit-logs` (project managers only)
 - `GET /api/v1/admin/overview`, `/users`, `/settings`, `/audit-logs` (verified allowlisted platform administrators only)
 - `PATCH /api/v1/admin/users/:userId` (activate or deactivate a user; deactivation revokes sessions and pending auth tokens)
@@ -123,3 +147,7 @@ Initial routes:
 Project data and file endpoints accept either an access token or an `x-api-key` header, with separate data/file read-write scopes. Collection listing accepts `filter` as a URL-encoded JSON object of up to 10 scalar top-level field values for exact matching (for example `?filter=%7B%22status%22%3A%22published%22%7D`) and `sort` as up to three comma-separated top-level field names; prefix a field with `-` for descending order (for example `?sort=-createdAt,title`). Sorting is stable by record ID; absent fields sort last. Uploads use multipart field `file`; detected PNG, JPEG, GIF, WebP, and PDF content types must match the declared MIME type. `MAX_FILE_BYTES` defaults to 5 MiB and is capped at 10 MiB. Project API keys are shown only on creation; their raw value is never persisted or returned by list endpoints.
 
 Webhook subscriptions support `data.created`, `data.updated`, `data.deleted`, `file.uploaded`, and `file.deleted`. A generated signing secret is shown only when the webhook is created or its secret is rotated. Receivers should verify `X-NanoBaaS-Signature` (`t=<unix timestamp>,v1=<hex HMAC-SHA256>`) against the exact raw request body and reject timestamps more than five minutes from their clock. Webhook URLs cannot contain credentials, query strings, or fragments; use the signed header for receiver authentication. Delivery attempts are durable, limited to five per event, and retained for up to 30 days after completion. A subscription may have at most 100 queued/in-flight events; writes that would exceed this bound fail with `503` rather than silently dropping the event. Delivery is paused unless the encryption key is configured.
+
+Realtime Pub/Sub is separate from webhooks. Connect to `ws://localhost:3000/api/v1/projects/<projectId>/realtime` (use `wss://` behind TLS). Send the short-lived access token in the first WebSocket message, never in the URL: `{"type":"authenticate","accessToken":"<accessToken>"}`. After receiving `authenticated`, send `{"type":"subscribe","channel":"orders"}` or publish `{"type":"publish","channel":"orders","event":"order.created","payload":{"id":"123"}}`. Messages are delivered only to currently connected subscribers on the same project and channel. They are ephemeral, not stored or replayed after reconnect.
+
+Only active project members may authenticate; project owners have all permissions, while other members need `realtime:subscribe` and/or `realtime:publish` assigned through a project role. Browser origins must be same-origin or included in `CORS_ORIGINS`. The server caps connections at 256 total, 100 per project and 5 per user per project; each connection may subscribe to 10 channels, send up to 120 frames and 30 publishes per 10 seconds, and send frames up to 16 KiB. Slow consumers are disconnected above a 256 KiB send buffer. WebSocket Pub/Sub is process-local and intended for the documented single-instance deployment; multiple API instances require a shared broker before they can exchange channel messages.

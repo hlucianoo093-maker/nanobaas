@@ -7,6 +7,7 @@ import rateLimit from "@fastify/rate-limit";
 import swagger from "@fastify/swagger";
 import swaggerUi from "@fastify/swagger-ui";
 import fastifyStatic from "@fastify/static";
+import websocket from "@fastify/websocket";
 import argon2 from "argon2";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -16,6 +17,7 @@ import { z } from "zod";
 import type { AppConfig } from "./config.js";
 import { createDatabase, type DatabaseConnection } from "./db/index.js";
 import { createEmailSender, type EmailSender } from "./email.js";
+import { MAX_REALTIME_MESSAGE_BYTES, RealtimeHub, type RealtimeIdentity } from "./realtime/hub.js";
 import { LocalObjectStorage, type ObjectStorage } from "./storage/object-storage.js";
 import { encryptWebhookSecret } from "./webhooks/crypto.js";
 import { enqueueWebhookEvent } from "./webhooks/queue.js";
@@ -119,6 +121,18 @@ const webhookUpdateSchema = z.object({
   isActive: z.boolean().optional()
 }).strict().refine((value) => Object.keys(value).length > 0)
   .refine((value) => !value.events || new Set(value.events).size === value.events.length);
+const realtimeChannelSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/);
+const realtimeClientMessageSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("authenticate"), accessToken: z.string().min(20).max(2048) }).strict(),
+  z.object({ type: z.literal("subscribe"), channel: realtimeChannelSchema }).strict(),
+  z.object({ type: z.literal("unsubscribe"), channel: realtimeChannelSchema }).strict(),
+  z.object({
+    type: z.literal("publish"),
+    channel: realtimeChannelSchema,
+    event: z.string().regex(/^[a-z][a-z0-9_.-]{0,63}$/),
+    payload: z.record(z.string(), z.unknown())
+  }).strict()
+]);
 
 function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
@@ -184,6 +198,7 @@ export async function createApp({
     trustProxy: config.trustProxy,
     bodyLimit: 1024 * 1024
   });
+  const realtimeHub = new RealtimeHub();
 
   await app.register(helmet);
   await app.register(cors, {
@@ -199,11 +214,18 @@ export async function createApp({
     limits: { fileSize: config.MAX_FILE_BYTES, files: 1, fields: 10, parts: 11 }
   });
   await app.register(jwt, { secret: config.JWT_SECRET, sign: { expiresIn: "15m" } });
+  await app.register(websocket, {
+    options: { maxPayload: MAX_REALTIME_MESSAGE_BYTES, perMessageDeflate: false },
+    errorHandler(error, socket, request) {
+      request.log.debug({ err: error }, "Realtime WebSocket connection closed");
+      socket.terminate();
+    }
+  });
   await app.register(swagger, {
     openapi: {
       info: { title: "NanoBaaS API", version: "0.1.0" },
       servers: [{ url: `http://localhost:${config.PORT}` }],
-      tags: [{ name: "system" }, { name: "auth" }, { name: "projects" }, { name: "data" }, { name: "authorization" }, { name: "storage" }, { name: "webhooks" }, { name: "admin" }],
+      tags: [{ name: "system" }, { name: "auth" }, { name: "projects" }, { name: "data" }, { name: "authorization" }, { name: "storage" }, { name: "webhooks" }, { name: "realtime" }, { name: "admin" }],
       components: {
         securitySchemes: {
           bearerAuth: { type: "http", scheme: "bearer", bearerFormat: "JWT" },
@@ -277,6 +299,17 @@ export async function createApp({
       JOIN permissions p ON p.id = rp.permission_id
       WHERE ur.project_id = ? AND ur.user_id = ? AND p.name = ? LIMIT 1
     `).get(projectId, userId, permission));
+  };
+
+  const hasActiveRealtimeMembership = (identity: RealtimeIdentity): boolean => {
+    if (identity.expiresAt <= Math.floor(Date.now() / 1000)) return false;
+    return Boolean(connection.client.prepare(`
+      SELECT 1 FROM sessions s
+      JOIN users u ON u.id = s.user_id
+      JOIN project_members m ON m.user_id = u.id
+      WHERE s.id = ? AND s.user_id = ? AND m.project_id = ?
+      AND s.revoked_at IS NULL AND s.expires_at > ? AND u.is_active = 1
+    `).get(identity.sessionId, identity.userId, identity.projectId, new Date().toISOString()));
   };
 
   const projectAuth = async (request: FastifyRequest, reply: FastifyReply) => {
@@ -894,6 +927,201 @@ export async function createApp({
       WHERE m.user_id = ? ORDER BY p.created_at DESC
     `).all(request.user.sub)
   }));
+
+  app.get<{ Params: { projectId: string } }>("/api/v1/projects/:projectId/realtime", {
+    websocket: true,
+    config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
+    schema: { tags: ["realtime"], description: "Project-scoped ephemeral WebSocket pub/sub. Authenticate with an access token in the first message." },
+    preValidation: async (request, reply) => {
+      if (!z.string().uuid().safeParse(request.params.projectId).success) {
+        return reply.code(400).send({ error: { code: "VALIDATION_ERROR", message: "A valid project ID is required" } });
+      }
+      const origin = request.headers.origin;
+      const requestOrigin = request.headers.host ? `${request.protocol ?? "http"}://${request.headers.host}` : undefined;
+      if (origin && origin !== requestOrigin && !config.corsOrigins.includes(origin)) {
+        return reply.code(403).send({ error: { code: "FORBIDDEN", message: "Origin is not allowed" } });
+      }
+    }
+  }, (socket, request) => {
+    const projectId = request.params.projectId;
+    if (!realtimeHub.connect(socket, projectId)) {
+      socket.close(1013, "Connection capacity reached");
+      return;
+    }
+
+    let identity: RealtimeIdentity | undefined;
+    let invalidMessageCount = 0;
+    let publishWindowStart = Date.now();
+    let publishCount = 0;
+    let messageWindowStart = Date.now();
+    let messageCount = 0;
+    let pendingMessageCount = 0;
+    let messageQueue = Promise.resolve();
+    const authenticationTimeout = setTimeout(() => {
+      if (!identity) {
+        realtimeHub.send(socket, { type: "error", code: "AUTHENTICATION_TIMEOUT" });
+        socket.close(1008, "Authentication required");
+      }
+    }, 5000);
+    authenticationTimeout.unref();
+    socket.once("close", () => {
+      clearTimeout(authenticationTimeout);
+      realtimeHub.remove(socket);
+    });
+
+    const rejectInvalidMessage = () => {
+      invalidMessageCount += 1;
+      realtimeHub.send(socket, { type: "error", code: "INVALID_MESSAGE" });
+      if (invalidMessageCount >= 3) socket.close(1008, "Too many invalid messages");
+    };
+
+    socket.on("message", (data, isBinary) => {
+      const now = Date.now();
+      if (now - messageWindowStart >= 10_000) {
+        messageWindowStart = now;
+        messageCount = 0;
+      }
+      messageCount += 1;
+      if (messageCount > 120 || pendingMessageCount >= 16) {
+        realtimeHub.send(socket, { type: "error", code: "RATE_LIMITED" });
+        socket.close(1013, "Message rate limit exceeded");
+        return;
+      }
+      pendingMessageCount += 1;
+      messageQueue = messageQueue.then(async () => {
+        if (isBinary) {
+          rejectInvalidMessage();
+          return;
+        }
+
+        const text = Buffer.isBuffer(data)
+          ? data.toString("utf8")
+          : Array.isArray(data)
+            ? Buffer.concat(data).toString("utf8")
+            : Buffer.from(data).toString("utf8");
+        let body: unknown;
+        try {
+          body = JSON.parse(text);
+        } catch {
+          rejectInvalidMessage();
+          return;
+        }
+        const parsed = realtimeClientMessageSchema.safeParse(body);
+        if (!parsed.success) {
+          rejectInvalidMessage();
+          return;
+        }
+
+        if (!identity) {
+          if (parsed.data.type !== "authenticate") {
+            realtimeHub.send(socket, { type: "error", code: "AUTHENTICATION_REQUIRED" });
+            socket.close(1008, "Authentication required");
+            return;
+          }
+
+          let claims: { sub: string; sid: string; exp: number };
+          try {
+            claims = await request.server.jwt.verify(parsed.data.accessToken) as { sub: string; sid: string; exp: number };
+          } catch {
+            realtimeHub.send(socket, { type: "error", code: "UNAUTHORIZED" });
+            socket.close(1008, "Authentication failed");
+            return;
+          }
+          if (typeof claims.sub !== "string" || typeof claims.sid !== "string" || typeof claims.exp !== "number") {
+            realtimeHub.send(socket, { type: "error", code: "UNAUTHORIZED" });
+            socket.close(1008, "Authentication failed");
+            return;
+          }
+          const authenticatedIdentity: RealtimeIdentity = {
+            projectId,
+            userId: claims.sub,
+            sessionId: claims.sid,
+            expiresAt: claims.exp
+          };
+          if (!hasActiveRealtimeMembership(authenticatedIdentity) || !realtimeHub.authenticate(socket, authenticatedIdentity)) {
+            realtimeHub.send(socket, { type: "error", code: "PROJECT_ACCESS_DENIED" });
+            socket.close(1008, "Project access denied");
+            return;
+          }
+          identity = authenticatedIdentity;
+          clearTimeout(authenticationTimeout);
+          realtimeHub.send(socket, { type: "authenticated", projectId });
+          return;
+        }
+
+        if (parsed.data.type === "authenticate") {
+          realtimeHub.send(socket, { type: "error", code: "ALREADY_AUTHENTICATED" });
+          return;
+        }
+        if (!hasActiveRealtimeMembership(identity)) {
+          realtimeHub.send(socket, { type: "error", code: "UNAUTHORIZED" });
+          socket.close(1008, "Session expired or revoked");
+          return;
+        }
+
+        if (parsed.data.type === "subscribe") {
+          if (!hasProjectPermission(projectId, identity.userId, "realtime:subscribe")) {
+            realtimeHub.send(socket, { type: "error", code: "FORBIDDEN" });
+            socket.close(1008, "Subscribe permission required");
+            return;
+          }
+          if (!realtimeHub.subscribe(socket, parsed.data.channel)) {
+            realtimeHub.send(socket, { type: "error", code: "SUBSCRIPTION_LIMIT" });
+            return;
+          }
+          realtimeHub.send(socket, { type: "subscribed", channel: parsed.data.channel });
+          return;
+        }
+
+        if (parsed.data.type === "unsubscribe") {
+          realtimeHub.unsubscribe(socket, parsed.data.channel);
+          realtimeHub.send(socket, { type: "unsubscribed", channel: parsed.data.channel });
+          return;
+        }
+
+        if (!hasProjectPermission(projectId, identity.userId, "realtime:publish")) {
+          realtimeHub.send(socket, { type: "error", code: "FORBIDDEN" });
+          return;
+        }
+        const now = Date.now();
+        if (now - publishWindowStart >= 10_000) {
+          publishWindowStart = now;
+          publishCount = 0;
+        }
+        publishCount += 1;
+        if (publishCount > 30) {
+          realtimeHub.send(socket, { type: "error", code: "RATE_LIMITED" });
+          socket.close(1013, "Publish rate limit exceeded");
+          return;
+        }
+
+        const message = {
+          type: "message",
+          id: randomUUID(),
+          channel: parsed.data.channel,
+          event: parsed.data.event,
+          payload: parsed.data.payload,
+          sentAt: new Date().toISOString()
+        };
+        if (Buffer.byteLength(JSON.stringify(message), "utf8") > MAX_REALTIME_MESSAGE_BYTES) {
+          realtimeHub.send(socket, { type: "error", code: "MESSAGE_TOO_LARGE" });
+          return;
+        }
+        realtimeHub.publish(
+          projectId,
+          parsed.data.channel,
+          message,
+          (recipient) => hasActiveRealtimeMembership(recipient)
+            && hasProjectPermission(projectId, recipient.userId, "realtime:subscribe")
+        );
+        realtimeHub.send(socket, { type: "published", id: message.id });
+      }).catch((error: unknown) => {
+        request.log.error({ err: error }, "Realtime message processing failed");
+        realtimeHub.send(socket, { type: "error", code: "INTERNAL_ERROR" });
+        socket.close(1011, "Realtime message processing failed");
+      }).finally(() => { pendingMessageCount -= 1; });
+    });
+  });
 
   app.get<{ Params: { projectId: string } }>("/api/v1/projects/:projectId", {
     preHandler: auth,
@@ -1860,6 +2088,7 @@ export async function createApp({
   app.addHook("onClose", async () => {
     if (webhookInterval) clearInterval(webhookInterval);
     if (webhookRun) await webhookRun;
+    realtimeHub.closeAll();
     if (!database) connection.close();
   });
 

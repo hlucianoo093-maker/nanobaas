@@ -8,6 +8,7 @@ import { loadConfig } from "../src/config.js";
 import { createDatabase, type DatabaseConnection } from "../src/db/index.js";
 import type { FastifyInstance } from "fastify";
 import type { EmailSender } from "../src/email.js";
+import type { RawData, WebSocket as WebSocketClient } from "ws";
 import { LocalObjectStorage } from "../src/storage/object-storage.js";
 import { signWebhookPayload, verifyWebhookSignature } from "../src/webhooks/crypto.js";
 import { WebhookDeliveryError, deliverWebhook, validateWebhookUrl } from "../src/webhooks/transport.js";
@@ -67,13 +68,70 @@ describe("NanoBaaS API", () => {
     return response.json().data as { user: { id: string }; accessToken: string; refreshToken: string };
   }
 
+  function nextSocketMessages(
+    socket: WebSocketClient,
+    count: number,
+    timeoutMs = 1000
+  ): Promise<Record<string, unknown>[]> {
+    return new Promise((resolve, reject) => {
+      const messages: Record<string, unknown>[] = [];
+      const cleanup = () => {
+        clearTimeout(timeout);
+        socket.off("message", onMessage);
+        socket.off("error", onError);
+        socket.off("close", onClose);
+      };
+      const onMessage = (data: RawData) => {
+        const text = Buffer.isBuffer(data)
+          ? data.toString("utf8")
+          : Array.isArray(data)
+            ? Buffer.concat(data).toString("utf8")
+            : Buffer.from(data).toString("utf8");
+        messages.push(JSON.parse(text) as Record<string, unknown>);
+        if (messages.length >= count) {
+          cleanup();
+          resolve(messages);
+        }
+      };
+      const onError = (error: Error) => {
+        cleanup();
+        reject(error);
+      };
+      const onClose = (code: number, reason: Buffer) => {
+        cleanup();
+        reject(new Error(`WebSocket closed before message (${code}): ${reason.toString("utf8")}`));
+      };
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error(`Timed out waiting for a WebSocket message (state ${socket.readyState})`));
+      }, timeoutMs);
+      socket.on("message", onMessage);
+      socket.once("error", onError);
+      socket.once("close", onClose);
+    });
+  }
+
+  function nextSocketMessage(socket: WebSocketClient, timeoutMs = 1000): Promise<Record<string, unknown>> {
+    return nextSocketMessages(socket, 1, timeoutMs).then((messages) => messages[0]!);
+  }
+
+  async function authenticateSocket(server: FastifyInstance, projectId: string, accessToken: string, origin?: string) {
+    const socket = await server.injectWS(
+      `/api/v1/projects/${projectId}/realtime`,
+      origin ? { headers: { origin, host: "localhost:3000" } } : undefined
+    );
+    const response = nextSocketMessage(socket);
+    socket.send(JSON.stringify({ type: "authenticate", accessToken }));
+    return { socket, response: await response };
+  }
+
   it("migrates the SQLite schema with foreign keys and WAL enabled", async () => {
     temporaryDirectory = mkdtempSync(join(tmpdir(), "nanobaas-test-"));
     database = createDatabase(join(temporaryDirectory, "test.sqlite"));
     expect(database?.client.pragma("foreign_keys", { simple: true })).toBe(1);
     expect(database?.client.pragma("journal_mode", { simple: true })).toBe("wal");
     expect(database?.client.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'projects'").get()).toBeTruthy();
-    expect(database?.client.prepare("SELECT name FROM _nanobaas_migrations").all()).toHaveLength(5);
+    expect(database?.client.prepare("SELECT name FROM _nanobaas_migrations").all()).toHaveLength(6);
   });
 
   it("accepts blank optional SMTP settings and rejects incomplete SMTP configuration", () => {
@@ -1084,5 +1142,128 @@ describe("NanoBaaS API", () => {
     });
     expect(response.statusCode).toBe(503);
     expect(response.json().error.code).toBe("EMAIL_DELIVERY_UNAVAILABLE");
+  });
+
+  it("supports authenticated, project-isolated ephemeral channel pub/sub", async () => {
+    const server = await setup();
+    const owner = await register(server, "realtime-owner@example.test");
+    const ownerHeaders = { authorization: `Bearer ${owner.accessToken}` };
+    const firstProjectResponse = await server.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: ownerHeaders,
+      payload: { name: "Realtime One", slug: "realtime-one" }
+    });
+    const secondProjectResponse = await server.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: ownerHeaders,
+      payload: { name: "Realtime Two", slug: "realtime-two" }
+    });
+    const firstProjectId = firstProjectResponse.json().data.id as string;
+    const secondProjectId = secondProjectResponse.json().data.id as string;
+    await server.ready();
+
+    const firstConnection = await authenticateSocket(server, firstProjectId, owner.accessToken, "http://localhost:3000");
+    const secondConnection = await authenticateSocket(server, firstProjectId, owner.accessToken);
+    const isolatedConnection = await authenticateSocket(server, secondProjectId, owner.accessToken);
+    expect(firstConnection.response).toMatchObject({ type: "authenticated", projectId: firstProjectId });
+    expect(secondConnection.response.type).toBe("authenticated");
+    expect(isolatedConnection.response.type).toBe("authenticated");
+
+    for (const connection of [firstConnection, secondConnection, isolatedConnection]) {
+      const subscribed = nextSocketMessage(connection.socket);
+      connection.socket.send(JSON.stringify({ type: "subscribe", channel: "orders" }));
+      expect(await subscribed).toMatchObject({ type: "subscribed", channel: "orders" });
+    }
+
+    const firstResponses = nextSocketMessages(firstConnection.socket, 2);
+    const secondDelivery = nextSocketMessage(secondConnection.socket);
+    firstConnection.socket.send(JSON.stringify({
+      type: "publish",
+      channel: "orders",
+      event: "order.created",
+      payload: { orderId: "order-1" }
+    }));
+
+    const [firstMessage, acknowledgement] = await firstResponses;
+    expect(firstMessage).toMatchObject({
+      type: "message",
+      channel: "orders",
+      event: "order.created",
+      payload: { orderId: "order-1" }
+    });
+    expect(acknowledgement?.type).toBe("published");
+    expect(await secondDelivery).toMatchObject({ id: firstMessage.id, payload: { orderId: "order-1" } });
+    await expect(nextSocketMessage(isolatedConnection.socket, 50)).rejects.toThrow("Timed out");
+  });
+
+  it("rejects WebSocket origins outside the same-origin and CORS allowlist", async () => {
+    const server = await setup();
+    await server.ready();
+    await expect(server.injectWS(`/api/v1/projects/${randomUUID()}/realtime`, {
+      headers: { origin: "https://untrusted.example", host: "localhost:3000" }
+    })).rejects.toThrow("Unexpected server response: 403");
+  });
+
+  it("requires explicit realtime role permissions for project members", async () => {
+    const server = await setup();
+    const owner = await register(server, "realtime-role-owner@example.test");
+    const member = await register(server, "realtime-role-member@example.test");
+    const ownerHeaders = { authorization: `Bearer ${owner.accessToken}` };
+    const projectResponse = await server.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: ownerHeaders,
+      payload: { name: "Realtime Roles", slug: "realtime-roles" }
+    });
+    const projectId = projectResponse.json().data.id as string;
+    const addMember = await server.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/members`,
+      headers: ownerHeaders,
+      payload: { email: "realtime-role-member@example.test" }
+    });
+    expect(addMember.statusCode).toBe(201);
+    await server.ready();
+
+    const deniedConnection = await authenticateSocket(server, projectId, member.accessToken);
+    const denied = nextSocketMessage(deniedConnection.socket);
+    deniedConnection.socket.send(JSON.stringify({ type: "subscribe", channel: "updates" }));
+    expect(await denied).toMatchObject({ type: "error", code: "FORBIDDEN" });
+    deniedConnection.socket.terminate();
+
+    const roleResponse = await server.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/roles`,
+      headers: ownerHeaders,
+      payload: {
+        name: "realtime",
+        description: "Use ephemeral realtime channels",
+        permissions: ["realtime:subscribe", "realtime:publish"]
+      }
+    });
+    expect(roleResponse.statusCode).toBe(201);
+    const assignRole = await server.inject({
+      method: "PUT",
+      url: `/api/v1/projects/${projectId}/members/${member.user.id}/roles`,
+      headers: ownerHeaders,
+      payload: { roleIds: [roleResponse.json().data.id] }
+    });
+    expect(assignRole.statusCode).toBe(200);
+
+    const authorizedConnection = await authenticateSocket(server, projectId, member.accessToken);
+    const subscribed = nextSocketMessage(authorizedConnection.socket);
+    authorizedConnection.socket.send(JSON.stringify({ type: "subscribe", channel: "updates" }));
+    expect(await subscribed).toMatchObject({ type: "subscribed", channel: "updates" });
+
+    const published = nextSocketMessage(authorizedConnection.socket);
+    authorizedConnection.socket.send(JSON.stringify({
+      type: "publish",
+      channel: "updates",
+      event: "record.changed",
+      payload: { id: "record-1" }
+    }));
+    expect((await published).type).toBe("message");
   });
 });

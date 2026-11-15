@@ -30,7 +30,7 @@ describe("SQLite database operations", () => {
     `).run("project-1", "Backup source", "backup-source", "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z");
 
     const result = await backupDatabase(sourcePath, backupPath);
-    expect(result.migrationCount).toBe(5);
+    expect(result.migrationCount).toBe(6);
     expect(verifyDatabaseFile(backupPath).integrity).toBe("ok");
 
     const snapshot = new Database(backupPath, { readonly: true });
